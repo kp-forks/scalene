@@ -819,9 +819,7 @@ class Scalene:
         # (issue #1056 — a macOS kernel save/restore bug). On these machines
         # drive CPU sampling from a background thread instead of a timer
         # signal, so nothing is ever delivered to an SME thread.
-        use_thread_sampler = (
-            sys.platform == "darwin" and is_apple_silicon_sme()
-        )
+        use_thread_sampler = sys.platform == "darwin" and is_apple_silicon_sme()
         # The sample queues are needed for memory poll-draining whenever a
         # background thread (Windows timer thread, or the Apple-SME sampler)
         # owns memory processing instead of the malloc/free/memcpy signals.

@@ -29,6 +29,7 @@ for worker threads — rather than relying on the signal-deferral timing
 trick that needs an actual signal. See ``scalene_cpu_profiler`` and the
 ``probe_frames_sampler`` prototype.
 """
+
 import contextlib
 import threading
 from typing import Optional
