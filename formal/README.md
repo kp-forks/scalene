@@ -4,33 +4,67 @@ This directory contains machine-checked formal models of Scalene's runtime,
 plus a **proof→production pipeline** that extracts the proven algorithms to
 Python and differentially tests the real profiler against them.
 
-1. **Signal / iteration safety** — the profile-output loop never faults from a
-   concurrent signal-handler mutation of the shared stacks dictionaries.
-2. **Deadlock freedom & signal-safety** — Scalene's lock/queue topology cannot
-   deadlock, and no signal handler ever blocks on a lock.
-3. **Attribution bookkeeping** — CPU time and memory bytes are conserved
-   (attributed exactly once, totals preserved) and the Python/C split fractions
-   stay in `[0, 1]`.
-4. **Bounded heavy-hitter accounting** — the Space-Saving `combined_stacks`
-   table never exceeds its capacity (`SpaceSaving.step_withinCap` /
-   `fold_withinCap`), and eviction always removes a minimum-count entry.
-5. **Proof → production** — the proven Lean defs are extracted to Python via
-   [LeanToPython](https://github.com/emeryberger/LeanToPython) and used as a
-   *verified oracle* that Scalene's real `_space_saving_increment` is checked
-   against (`tests/test_verified_space_saving.py`).
-6. **Profiler correctness** — the headline desideratum: the reported per-line
-   time/memory profile is an **unbiased, consistent** estimator of the truth
-   (`ProfilerCorrectness.estimator_unbiased`, `jointVariance_eq`). This is the
-   spec a profiler's *user* relies on; §3 proves the bookkeeping it rests on.
-7. **Poisson sampling** — the sampler's exponential inter-sample intervals
-   (`scalene_profiler.py:1108`) make sampling a Poisson process, which is what
-   *discharges* §6's i.i.d. hypothesis (inverse-CDF correctness + memorylessness).
-8. **GPU / copy-volume / python-split / leak detection** — GPU util, memcpy
-   volume, and the Python/native split fit the §6 weighted-average frame; memory
-   leak detection is a Bayesian (Rule-of-Succession) hypothesis test with proven
-   bounds, monotonicity, and false-positive guards.
-9. **Memory sampler** — the default ThresholdSampler conserves true net
-   allocation exactly (bounded residual); the Poisson sampler is unbiased.
+## Proof roundup — where the correctness effort stands, by subsystem
+
+**Lean 4:** 14 modules, 114 theorems, no `sorry`, standard axioms only.
+**TLA+/TLC:** 2 specs, exhaustively model-checked. Verdicts: **✅ Proven**,
+**⚠️ Partial**, **❌ Unproven**. This is the narrative view; [`STATUS.md`](STATUS.md)
+has the granular per-aspect table, and the numbered sections below (§1–§14) give
+the full statements with source mappings.
+
+**1. CPU profiling — the headline.** The reported per-line profile is an
+**unbiased, consistent** estimator of the truth: ✅ `estimator_unbiased` (right
+on average at any sample budget N), ✅ `jointVariance_eq` (variance = p(1−p)/N →
+0). The i.i.d. hypothesis this rests on is discharged, not assumed: ✅ the
+sampler is Poisson (`ExponentialSampler`, inverse-CDF + memorylessness) and ✅
+**PASTA** now links Poisson instants to time-fraction landing
+(`PoissonArrivals.uniform_realizes_trueFraction`, §12). ⚠️ that the C++ stamping
+*establishes* faithful placement is engineering, not Lean-proven; ❌ the
+Python/native per-sample classifier heuristic's accuracy.
+
+**2. Memory sampling.** ✅ the default ThresholdSampler conserves true net
+allocation exactly with bounded residual (`threshold_conserves`,
+`threshold_residual_bounded`), ✅ proven bisimilar to the literal two-counter C++
+(`step_bisim`), ✅ the Poisson sampler is unbiased, ✅ per-line byte fractions
+are faithful (`PerLineAttribution`).
+
+**3. Memory-leak detection — fully closed, incl. concurrency.** ✅ the leak score
+is a Rule-of-Succession probability in [0,1] with monotonicity and an exact
+decision rule (`MetricCorrectness`); ✅ its unguarded denominator is safe
+(`LeakTrackerAudit`, `frees ≤ allocs`); ✅ that safety survives the sig-queue /
+main-thread interleaving and `fork`, and the serialization is shown *necessary*
+(`LeakTrackerConcurrency`). The audit that built this found production bugs
+(below).
+
+**4. Metrics end-to-end across the C++/Python boundary.** ✅ **copy volume**
+(`CopyVolumeWiring`, §13) and ✅ **malloc footprint / peak memory**
+(`MallocFootprintWiring`, §14) — the reported number equals what the native
+interposer observed, up to a bounded sampler residual. The footprint model
+handles the free-side `max(0,·)` clamp *honestly*: exact in the non-negative
+regime, and outside it the clamp can only over-report (`clamp_only_raises`),
+never silently undercount. ✅ GPU/copy/python-split arithmetic bounds; ❌
+GPU/accelerator device-acquisition paths.
+
+**5. Concurrency & signal safety (TLA+).** ✅ the `combined_stacks` race is
+reachable in the bug config (concrete 4-state counterexample) and impossible in
+the fix (`SignalSafety.tla`); ✅ no deadlock, the handler never blocks on a lock,
+output makes progress under fairness (`Deadlock.tla`). ✅ the snapshot algebra
+that underlies the fix (`SignalSafety.lean`). ⚠️ TLC is exhaustive only within
+bounds (`N=3`, `MaxHandler=2`).
+
+**6. Bounded data structures.** ✅ the Space-Saving `combined_stacks` table never
+exceeds capacity and evicts a minimum (`SpaceSaving`), and ✅ this is wired to
+production: the proven Lean defs are extracted to Python via
+[LeanToPython](https://github.com/emeryberger/LeanToPython) and differentially
+tested against the real `_space_saving_increment`
+(`tests/test_verified_space_saving.py`).
+
+**Not modeled:** output rendering (the three renderers — guarded by tests, where
+the four divide-by-zero bugs below were found), CLI/arg parsing, the
+`replacement_*` modules, floating-point rounding (proofs use exact ℚ), and the
+Jupyter/AI-provider GUI.
+
+---
 
 Two complementary tools are used, each where it is strongest:
 
@@ -40,9 +74,17 @@ Two complementary tools are used, each where it is strongest:
 | **Lean 4** | [`lean/`](lean/) | conservation/bounds arithmetic, snapshot algebra | machine-checked proof |
 
 > **Why both?** Race/deadlock properties are about *interleavings* — TLC
-> exhaustively explores them and produces concrete counterexample traces.
-> Conservation/bounds are about *arithmetic over all inputs* — Lean proves them
-> for unbounded quantities, which a model checker cannot.
+> exhaustively explores them and produces concrete counterexample traces, and it
+> checks *liveness* under fairness (progress, no starvation), which Lean has no
+> comfortable story for. Conservation/bounds are about *arithmetic over all
+> inputs* — Lean proves them for unbounded quantities, which a model checker
+> cannot. The engines are complementary, not redundant: retiring the TLC specs
+> would drop counterexample-search and liveness coverage with nothing to replace
+> them. One overlap is deliberate — `LeakTrackerConcurrency.lean` proves an
+> interleaving property in Lean but *assumes step-atomicity as an axiom*
+> (justified by the RLock + thread join); deriving that atomicity from the
+> sig-queue's operational semantics is a natural next TLA+ job. See
+> [`STATUS.md`](STATUS.md) § "Why two engines".
 
 All TLA+ runs and Lean proofs reproduce from a clean checkout (commands below).
 The Lean proofs contain **no `sorry`/`admit`** and depend only on Lean's three
@@ -459,6 +501,112 @@ fork reset are in place — both of which are shown here to be required.
 
 ---
 
+## 12. PASTA: the sampler→correctness link — `lean/Scalene/PoissonArrivals.lean`
+
+§6 (`ProfilerCorrectness`) *assumes* each timer tick lands on line ℓ with
+probability `trueFraction ℓ`. §7 (`ExponentialSampler`) proves the sampler's
+inter-arrival gaps are Exponential, so the sample instants form a Poisson
+process — but the step "Poisson instants ⇒ landing probability = time fraction"
+was cited as PASTA, not proven. This module proves it, in the discrete-time form
+the effort targeted.
+
+Model the horizon as `M` equal time slots, `slots i` = the line running during
+slot `i`. A Poisson arrival, conditioned on its count, occurs at a uniformly
+random time (the order-statistics property) — here, a uniform slot.
+
+- `uniform_landing_eq_timeFraction` — **PASTA identity**: the expected indicator
+  that a uniform arrival lands on ℓ equals ℓ's fraction of time (`timeCount ℓ / M`).
+- `sum_timeFraction` — the time fractions form a probability distribution.
+- `uniform_realizes_trueFraction` — **the discharge**: build the
+  `ProfilerCorrectness.Truth` induced by the timeline; its `trueFraction` (the
+  assumed sampling law) equals both the time fraction and
+  `Truth.expect (indicator ℓ)`. So the hypothesis feeding `estimator_unbiased` /
+  `jointVariance_eq` is produced by the sampler mechanism, not postulated.
+
+Boundary: this is the discrete-time analogue (uniform-over-slots). The
+continuous-time order-statistics theorem for the Poisson process is not
+formalized; the discrete form is the operative content for a tick-sampled
+profiler.
+
+## 13. Copy volume end-to-end (C++↔Python) — `lean/Scalene/CopyVolumeWiring.lean`
+
+Every other Lean module stops on one side of the native/Python line. This one
+spans it, modeling both the C++ `MemcpySampler` accumulator/flush state machine
+(`src/include/memcpysampler.hpp:319-361`) and the Python reader
+(`process_memcpy_samples`, `scalene_memory_profiler.py:56-99`).
+
+**Source mapping**
+
+| Model element | Scalene source | Meaning |
+|---|---|---|
+| `cppStep .copy n ℓ` | `incrementMemoryOps`: `_memcpyOps += n` | accumulate bytes, no trigger |
+| `cppStep .copyFlush n ℓ` | `sample(n)` triggers → `writeCount()` emits `_memcpyOps`, then `_memcpyOps = 0` | flush accumulator to a record on line ℓ, reset |
+| `Record.pid` | `getpid()` in `writeCount` (`snprintf` `%d`) | records tagged with the emitting pid |
+| `pythonTotal` filter | `if int(curr_pid) != int(pid): continue` (`:82`) | Python drops foreign-pid records |
+| `+= count` | `memcpy_samples[file][line] += count` (`:98`) | Python accumulates per line |
+
+**Theorems**
+
+- `flushed_add_residual` — C++ conservation: bytes written to records + the
+  unflushed accumulator = total bytes observed. Nothing invented or lost.
+- `python_total_eq_flushed` — the mapfile transfer + pid filter neither drop nor
+  double-count in-process bytes (records carry the running pid, proven via
+  `cppRun_records_pid`).
+- `roundtrip_conservation` — **headline**: the copy volume Python reports equals
+  the bytes C++ observed minus the in-flight residual. `scalene view`'s
+  copy-volume column faithfully reflects observed memcpy traffic.
+- `foreign_pid_dropped` — a child process's records don't pollute this process's
+  total.
+- `residual_zero_after_flush` — a flush resets the accumulator, so the residual
+  is bounded by one sampling interval; the round-trip discrepancy is at most the
+  sampling granularity, not arbitrary.
+
+Boundary: models the emitter/reader state machines and the byte accounting, not
+the mapfile's low-level byte-format parsing or partial-read handling.
+
+---
+
+## 14. Malloc footprint end-to-end (C++↔Python) — `lean/Scalene/MallocFootprintWiring.lean`
+
+The harder memory path: the *current footprint* / peak-memory number, spanning
+the C++ `SampleHeap` emitter (`sampleheap.hpp:183-316`) and the Python reader
+`process_malloc_free_samples` (`scalene_memory_profiler.py:102-228`). The C++
+half reuses the ThresholdSampler already proven in `MemorySampler.lean`.
+
+**The subtlety, modeled not assumed.** The Python free path clamps the running
+footprint to `max(0, current − count)` on every free (`:218`). That clamp
+*breaks* pure conservation: if frees drive the footprint below 0 (startup
+misses, per the code comment), it silently adds bytes back. A naive model that
+ignored the clamp would "prove" conservation falsely. So we prove the honest,
+conditional statements:
+
+| Model element | Scalene source | Meaning |
+|---|---|---|
+| `emitStep`/`emitRun` | `process_malloc`/`process_free` emit on sampler trigger | records carry the reported byte excess, action M/F, pid |
+| `stepFootprint` with `max 0 (·)` | `current_footprint = max(0, current − count)` (`:218`) | the free-side clamp, modeled literally |
+| `Safe` predicate | "Scalene can miss some initial allocations" (`:215`) | the regime where the clamp is inert |
+| `pidFilter` | `if int(curr_pid) != int(pid): continue` (`:145`) | per-process filter |
+
+**Theorems**
+
+- `emit_records_sum` — the records the C++ ThresholdSampler emits sum (signed)
+  to its `reported` net (bridge to `MemorySampler.threshold_conserves`).
+- `clamp_is_identity_of_safe` — while the footprint stays ≥ 0, the clamp is a
+  no-op and the Python fold is exactly additive.
+- `roundtrip_conservation_of_safe` — **headline**: in that regime the reported
+  footprint delta = (true net − sampler residual) / BYTES_PER_MB. End to end.
+- `clamp_only_raises` — *without* the non-negativity assumption, the clamp can
+  only push the footprint **up**: the reported footprint is always ≥ the
+  additive value, so the error is one-sided (over-reporting live memory), never
+  a silent undercount. The honest unconditional bound.
+- `foreign_pid_dropped`, `newline_marker_skipped` — the pid filter and NEWLINE
+  `continue` faithfully drop records that must not count.
+
+Boundary: reuses the sampler model for the C++ half; models the footprint fold
+and clamp, not the mapfile byte-format parsing.
+
+---
+
 ## What is *assumed* (model boundary)
 
 These models abstract, and the abstractions are the assumptions:
@@ -473,9 +621,21 @@ These models abstract, and the abstractions are the assumptions:
 - **Bounded constants for TLC.** `Keys = {k1,k2,k3}`, `N = 3`, `MaxHandler = 2`.
   These bounds make checking exhaustive and finite; the Lean snapshot lemmas
   generalize the safety argument to unbounded inputs.
+- **PASTA is now proven in discrete-time form** (`PoissonArrivals.lean`): a
+  uniform arrival over `M` time slots lands on line ℓ with probability equal to
+  ℓ's time fraction, and this realizes exactly the `trueFraction` sampling law
+  `ProfilerCorrectness` assumes. The continuous-time order-statistics proof is
+  still not formalized, but the sampler→correctness link is no longer merely
+  cited.
+- **Copy volume is now modeled end-to-end across the C++/Python boundary**
+  (`CopyVolumeWiring.lean`): the emitter accumulator/flush state machine and the
+  Python reader, with round-trip conservation. This is the first metric proven
+  across the native boundary.
 - **Out of scope (not yet modeled):** the C++ allocator's internal thread-local
-  `_pythonCount`/`_cCount` accounting; the mapfile IPC byte protocol; fork()
-  lock-state hazards beyond the stop/join discipline; GPU/accelerator paths.
+  `_pythonCount`/`_cCount` accounting; the mapfile IPC *byte-format* parsing
+  (the copy-volume model abstracts records, not their on-disk encoding); fork()
+  lock-state hazards beyond the stop/join discipline; GPU/accelerator device
+  paths; the per-sample Python/native classifier heuristic accuracy.
 
 ---
 
