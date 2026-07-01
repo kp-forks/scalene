@@ -704,9 +704,7 @@ class ScaleneOutput:
                     # two output paths are separate (see Scalene-Debugging.md
                     # "three renderers"), so the json.py fix did not cover it.
                     velocity = (
-                        leak[2] / stats.elapsed_time
-                        if stats.elapsed_time > 0
-                        else 0.0
+                        leak[2] / stats.elapsed_time if stats.elapsed_time > 0 else 0.0
                     )
                     output_str = f"Possible memory leak identified at line {str(leak[0])} (estimated likelihood: {(leak[1] * 100):3.0f}%, velocity: {velocity:3.0f} MB/s)"
                     console.print(output_str)
